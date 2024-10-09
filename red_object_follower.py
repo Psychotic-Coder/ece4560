@@ -4,10 +4,8 @@ import rospy
 import cv2
 import numpy as np
 from cv_bridge import CvBridge, CvBridgeError
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import PointCloud2, PointField
-import math
 
 class RedObjectFollower:
     def __init__(self):
@@ -27,9 +25,6 @@ class RedObjectFollower:
         # Variables to store the red object position and distance
         self.red_object_center = None
         self.red_object_distance = None
-
-        # Flag to control the robot's movement
-        self.is_moving = False
 
     def rgb_image_callback(self, data):
         try:
@@ -94,8 +89,17 @@ class RedObjectFollower:
             x, y = self.red_object_center
             self.red_object_distance = depth_image[y, x]
 
-            # If the distance is valid, start moving towards the object
-            if self.red_object_distance > 0 and self.red_object_distance < 10:
+            # Convert the distance to meters and check if it's valid
+            if self.red_object_distance > 0 and not np.isnan(self.red_object_distance):
+                # Display the distance on the OpenCV window
+                cv2.putText(depth_image, f"Distance: {self.red_object_distance:.2f} meters", 
+                            (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # Show the depth image with the distance
+                cv2.imshow("Red Object Distance", depth_image)
+                cv2.waitKey(1)
+
+                # Move towards the red object if it's farther than 10 cm
                 self.move_towards_red_object()
 
     def move_towards_red_object(self):
@@ -108,7 +112,7 @@ class RedObjectFollower:
                 twist.angular.z = 0  # No rotation
 
                 self.cmd_vel_pub.publish(twist)
-                rospy.loginfo(f"Moving towards the red object. Distance: {self.red_object_distance}")
+                rospy.loginfo(f"Moving towards the red object. Distance: {self.red_object_distance:.2f} meters")
             else:
                 # Stop the robot when it's close enough (within 10cm)
                 twist.linear.x = 0
