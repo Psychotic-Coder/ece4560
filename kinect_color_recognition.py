@@ -14,19 +14,35 @@ class ColorRecognition:
         # Subscribe to the Kinect's RGB image topic
         self.image_sub = rospy.Subscriber("/camera/rgb/image_color", Image, self.image_callback)
 
+        # Subscribe to the Kinect's depth image topic
+        self.depth_sub = rospy.Subscriber("/camera/depth_registered/image_raw", Image, self.depth_callback)
+
         # Use CvBridge to convert ROS images to OpenCV format
         self.bridge = CvBridge()
+
+        # Store the most recent RGB and depth images
+        self.rgb_image = None
+        self.depth_image = None
 
     def image_callback(self, data):
         try:
             # Convert ROS Image message to OpenCV image
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            self.rgb_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
         except CvBridgeError as e:
             rospy.logerr(e)
             return
 
-        # Process the image to recognize colors
-        self.detect_colors(cv_image)
+        # If both RGB and depth images are available, process them
+        if self.rgb_image is not None and self.depth_image is not None:
+            self.detect_colors(self.rgb_image)
+
+    def depth_callback(self, data):
+        try:
+            # Convert the ROS depth image to OpenCV format
+            self.depth_image = self.bridge.imgmsg_to_cv2(data, desired_encoding="passthrough")
+        except CvBridgeError as e:
+            rospy.logerr(e)
+            return
 
     def detect_colors(self, frame):
         # Convert the frame to HSV color space
@@ -52,7 +68,7 @@ class ColorRecognition:
         contours_green, _ = cv2.findContours(green_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         contours_blue, _ = cv2.findContours(blue_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Display the detected colors
+        # Display the detected colors and calculate the distance
         self.display_color_regions(frame, contours_red, (0, 0, 255), "Red")
         self.display_color_regions(frame, contours_green, (0, 255, 0), "Green")
         self.display_color_regions(frame, contours_blue, (255, 0, 0), "Blue")
@@ -65,10 +81,20 @@ class ColorRecognition:
         for contour in contours:
             area = cv2.contourArea(contour)
             if area > 500:  # Only consider larger areas
-                # Draw the contour and label the color
-                cv2.drawContours(frame, [contour], -1, color, 2)
+                # Get the bounding rectangle for the contour
                 x, y, w, h = cv2.boundingRect(contour)
-                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # Calculate the center of the contour
+                center_x, center_y = x + w // 2, y + h // 2
+
+                # If the depth image is available, get the depth at the contour's center
+                if self.depth_image is not None:
+                    # Extract the depth value at the center of the contour
+                    distance = self.depth_image[center_y, center_x]
+
+                    # Draw the contour, label, and distance on the image
+                    cv2.drawContours(frame, [contour], -1, color, 2)
+                    cv2.putText(frame, f"{label} - {distance:.2f} meters", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 if __name__ == '__main__':
     try:
