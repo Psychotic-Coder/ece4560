@@ -1,86 +1,114 @@
-import numpy as np
-import scipy.interpolate as spi
 import rospy
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-from tf.transformations import euler_from_quaternion
+import numpy as np
 
-# Initialize global variables for position and orientation
-current_x = 0.0
-current_y = 0.0
-current_yaw = 0.0
+def compute_cubic_spline(x_points, y_points, num_samples=100):
+    """
+    Compute cubic spline trajectory.
 
-def odom_callback(data):
-    global current_x, current_y, current_yaw
-    # Extract the current position
-    current_x = data.pose.pose.position.x
-    current_y = data.pose.pose.position.y
-    # Extract the current orientation in yaw
-    orientation_q = data.pose.pose.orientation
-    orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
-    (_, _, current_yaw) = euler_from_quaternion(orientation_list)
+    Parameters:
+    - x_points: List of x-coordinates.
+    - y_points: List of y-coordinates.
+    - num_samples: Number of samples for interpolation.
 
-def create_cubic_spline(waypoints_x, waypoints_y):
-    # Create a parameter array for the waypoints
-    t = np.linspace(0, 1, len(waypoints_x))
-    # Generate cubic splines for x and y
-    spline_x = spi.CubicSpline(t, waypoints_x)
-    spline_y = spi.CubicSpline(t, waypoints_y)
-    return spline_x, spline_y
+    Returns:
+    - trajectory: Array of (x, y) coordinates along the spline.
+    """
+    def cubic_coeffs(x0, x1, y0, y1, dy0, dy1):
+        A = np.array([
+            [0, 0, 0, 1],
+            [1, 1, 1, 1],
+            [0, 0, 1, 0],
+            [3, 2, 1, 0]
+        ])
+        b = np.array([y0, y1, dy0, dy1])
+        return np.linalg.solve(A, b)
 
-def track_trajectory(spline_x, spline_y, duration=10.0):
-    rospy.init_node('turtlebot_cubic_spline_tracker', anonymous=True)
-    velocity_publisher = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-    rospy.Subscriber('/odom', Odometry, odom_callback)
-    rate = rospy.Rate(10)  # 10 Hz control loop
+    trajectory = []
+    for i in range(len(x_points) - 1):
+        t = np.linspace(0, 1, num_samples // (len(x_points) - 1))
+        dx = x_points[i + 1] - x_points[i]
+        dy = y_points[i + 1] - y_points[i]
+        slope = dy / dx if dx != 0 else 0
+        coeffs = cubic_coeffs(0, 1, y_points[i], y_points[i + 1], 0, slope)
 
-    start_time = rospy.Time.now().to_sec()
-    while not rospy.is_shutdown():
-        current_time = rospy.Time.now().to_sec() - start_time
-        t = current_time / duration  # Normalize time to [0, 1]
+        x_i = np.linspace(x_points[i], x_points[i + 1], num_samples // (len(x_points) - 1))
+        y_i = coeffs[0] * t**3 + coeffs[1] * t**2 + coeffs[2] * t + coeffs[3]
 
-        if t > 1.0:  # End of trajectory
-            break
+        trajectory.extend(np.column_stack((x_i, y_i)))
 
-        # Get desired (x, y) positions from the spline
-        desired_x = spline_x(t)
-        desired_y = spline_y(t)
+    return np.array(trajectory)
 
-        # Compute errors
-        error_x = desired_x - current_x
-        error_y = desired_y - current_y
-        desired_yaw = np.arctan2(error_y, error_x)
-        yaw_error = desired_yaw - current_yaw
+def offset_trajectory(trajectory, offset_distance):
+    """
+    Apply an offset to the trajectory perpendicular to its direction.
 
-        # Normalize yaw error to [-pi, pi]
-        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
+    Parameters:
+    - trajectory: Array of (x, y) waypoints.
+    - offset_distance: Distance to offset perpendicular to the trajectory.
 
-        # Control gains
-        k_linear = 0.5
-        k_angular = 2.0
+    Returns:
+    - offset_trajectory: Array of (x, y) waypoints with offset.
+    """
+    offset_trajectory = []
+    for i in range(1, len(trajectory)):
+        dx = trajectory[i][0] - trajectory[i - 1][0]
+        dy = trajectory[i][1] - trajectory[i - 1][1]
+        norm = np.sqrt(dx**2 + dy**2)
 
-        # Compute control inputs
-        linear_velocity = k_linear * np.hypot(error_x, error_y)
-        angular_velocity = k_angular * yaw_error
+        # Perpendicular offset
+        if norm > 0:
+            offset_x = -dy * offset_distance / norm
+            offset_y = dx * offset_distance / norm
+        else:
+            offset_x = offset_y = 0
 
-        # Publish velocity command
-        cmd_vel = Twist()
-        cmd_vel.linear.x = linear_velocity
-        cmd_vel.angular.z = angular_velocity
-        velocity_publisher.publish(cmd_vel)
+        offset_trajectory.append([trajectory[i][0] + offset_x, trajectory[i][1] + offset_y])
 
+    return np.array(offset_trajectory)
+
+def track_trajectory(trajectory, pub, rate):
+    """
+    Track a given trajectory.
+
+    Parameters:
+    - trajectory: List of (x, y) waypoints to track.
+    - pub: ROS Publisher to send Twist messages.
+    - rate: ROS Rate for the publishing loop.
+    """
+    twist = Twist()
+    for i in range(1, len(trajectory)):
+        dx = trajectory[i][0] - trajectory[i - 1][0]
+        dy = trajectory[i][1] - trajectory[i - 1][1]
+
+        linear_velocity = np.sqrt(dx**2 + dy**2) / rate.sleep_dur.to_sec()
+        angular_velocity = np.arctan2(dy, dx)
+
+        twist.linear.x = linear_velocity
+        twist.angular.z = angular_velocity
+        pub.publish(twist)
         rate.sleep()
 
-if __name__ == "__main__":
-    # Define waypoints for the cubic spline
-    waypoints_x = [0, 1, 2, 3, 4]
-    waypoints_y = [0, 1, 0, -1, 0]
+if __name__ == '__main__':
+    rospy.init_node('offset_cubic_spline_tracker')
+    pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+    rate = rospy.Rate(10)
 
-    # Create the cubic spline
-    spline_x, spline_y = create_cubic_spline(waypoints_x, waypoints_y)
+    # Define waypoints for cubic spline
+    x_points = [0, 0.5, 1.0, 1.5]
+    y_points = [0, 0.2, 0.0, -0.2]
 
-    # Track the trajectory
-    try:
-        track_trajectory(spline_x, spline_y)
-    except rospy.ROSInterruptException:
-        pass
+    # Compute cubic spline
+    trajectory = compute_cubic_spline(x_points, y_points, num_samples=100)
+    
+    # Apply 10cm offset
+    offset_trajectory = offset_trajectory(trajectory, offset_distance=0.1)
+
+    # Track the offset trajectory
+    rospy.loginfo("Tracking trajectory with offset...")
+    track_trajectory(offset_trajectory, pub, rate)
+
+    # Stop the robot
+    twist = Twist()
+    pub.publish(twist)
+    rospy.loginfo("Tracking complete.")
