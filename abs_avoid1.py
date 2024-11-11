@@ -6,7 +6,6 @@ import numpy as np
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
 
 class RedObjectFollower:
     def __init__(self):
@@ -16,7 +15,6 @@ class RedObjectFollower:
         # Subscribers
         self.rgb_image_sub = rospy.Subscriber("/camera/rgb/image_color", Image, self.rgb_image_callback)
         self.depth_image_sub = rospy.Subscriber("/camera/depth_registered/image_raw", Image, self.depth_image_callback)
-        self.scan_sub = rospy.Subscriber('/scan', LaserScan, self.laser_scan_callback)
         
         # Publisher for TurtleBot velocity commands
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
@@ -24,11 +22,16 @@ class RedObjectFollower:
         # OpenCV bridge to convert ROS images to OpenCV format
         self.bridge = CvBridge()
 
-        # Variables to store the red object position, distance, and obstacles
+        # Variables to store the red object position and distance
         self.red_object_center = None
         self.red_object_distance = None
         self.image_width = None
-        self.obstacle_distance = float('inf')
+
+        # Motion control parameters
+        self.max_speed = 0.5  # Maximum speed
+        self.min_speed = 0.05  # Minimum speed for smooth start/stop
+        self.acceleration = 0.02  # Rate of speed increase
+        self.current_speed = 0.0  # Start with zero speed
 
     def rgb_image_callback(self, data):
         try:
@@ -59,20 +62,20 @@ class RedObjectFollower:
         # Get the distance to the red object
         self.get_object_distance(depth_image)
 
-    def laser_scan_callback(self, data):
-        # Store the minimum distance to any obstacle in front of the robot
-        self.obstacle_distance = min(data.ranges)
-
     def detect_red_object(self, frame):
         # Convert the frame to HSV color space
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         # Define red color range in HSV
-        red_lower = np.array([0, 120, 70])
-        red_upper = np.array([10, 255, 255])
+        red_lower1 = np.array([0, 120, 70])
+        red_upper1 = np.array([10, 255, 255])
+        red_lower2 = np.array([170, 120, 70])
+        red_upper2 = np.array([180, 255, 255])
 
         # Create a mask for red color
-        red_mask = cv2.inRange(hsv_frame, red_lower, red_upper)
+        red_mask1 = cv2.inRange(hsv_frame, red_lower1, red_upper1)
+        red_mask2 = cv2.inRange(hsv_frame, red_lower2, red_upper2)
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
 
         # Find contours in the mask
         contours, _ = cv2.findContours(red_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -89,51 +92,51 @@ class RedObjectFollower:
                 # Draw a rectangle and center point on the object
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.circle(frame, self.red_object_center, 5, (0, 255, 0), -1)
-
-                # Show the processed image
-                cv2.imshow("Red Object Detection", frame)
-                cv2.waitKey(1)
             else:
                 self.red_object_center = None
+
+        cv2.imshow("Red Object Detection", frame)
+        cv2.waitKey(1)
 
     def get_object_distance(self, depth_image):
         if self.red_object_center is not None:
             x, y = self.red_object_center
             self.red_object_distance = depth_image[y, x]
 
-            # Validate the distance
-            if self.red_object_distance > 0 and not np.isnan(self.red_object_distance):
+            # Move towards the red object if it's farther than 10 cm
+            if self.red_object_distance > 0.1:
                 self.move_towards_red_object()
 
     def move_towards_red_object(self):
         twist = Twist()
 
-        if self.red_object_distance is not None:
-            if self.red_object_distance > 0.1:  # If the object is farther than 10cm
-                # Adjust speed dynamically based on distance
-                twist.linear.x = min(0.5, 0.2 * self.red_object_distance)
-                
-                # Add angular control based on object position in the image frame
-                error = (self.red_object_center[0] - self.image_width / 2) / float(self.image_width / 2)
-                twist.angular.z = -error  # Rotate towards the object
+        # Smooth speed control
+        if self.red_object_distance > 1.0:
+            target_speed = self.max_speed
+        elif self.red_object_distance > 0.1:
+            target_speed = max(self.min_speed, self.red_object_distance * 0.5)
+        else:
+            target_speed = 0.0
 
-                # Obstacle avoidance: slow down if obstacle is near
-                if self.obstacle_distance < 0.5:
-                    twist.linear.x = 0  # Stop linear motion
-                    rospy.logwarn("Obstacle detected! Stopping.")
-                self.cmd_vel_pub.publish(twist)
-                rospy.loginfo(f"Moving towards red object. Distance: {self.red_object_distance:.2f}m, Obstacle: {self.obstacle_distance:.2f}m")
-            else:
-                # Stop the robot when it's close enough (within 10cm)
-                twist.linear.x = 0
-                twist.angular.z = 0
-                self.cmd_vel_pub.publish(twist)
-                rospy.loginfo("Red object is within 10cm. Stopping.")
-                rospy.signal_shutdown("Reached the target!")
+        # Smooth acceleration or deceleration
+        if self.current_speed < target_speed:
+            self.current_speed = min(self.current_speed + self.acceleration, target_speed)
+        elif self.current_speed > target_speed:
+            self.current_speed = max(self.current_speed - self.acceleration, target_speed)
+
+        twist.linear.x = self.current_speed
+
+        # Angular control
+        error = (self.red_object_center[0] - self.image_width / 2) / float(self.image_width / 2)
+        twist.angular.z = -error * 0.5  # Proportional control
+
+        self.cmd_vel_pub.publish(twist)
+        rospy.loginfo(f"Speed: {self.current_speed:.2f}, Distance: {self.red_object_distance:.2f}m, Angular Error: {error:.2f}")
 
 if __name__ == '__main__':
     try:
-        RedObjectFollower()
+        # Instantiate the class and keep the program running
+        follower = RedObjectFollower()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
