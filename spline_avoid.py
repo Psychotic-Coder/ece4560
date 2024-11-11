@@ -6,14 +6,13 @@ import numpy as np
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
-import time
 
-class RedObjectFollowerWithDynamicSpeed:
+class RedObjectFollower:
     def __init__(self):
         # Initialize the ROS node
-        rospy.init_node('red_object_follower_with_dynamic_speed', anonymous=True)
+        rospy.init_node('red_object_follower', anonymous=True)
         
-        # Subscribers for RGB and Depth images
+        # Subscribers
         self.rgb_image_sub = rospy.Subscriber("/camera/rgb/image_color", Image, self.rgb_image_callback)
         self.depth_image_sub = rospy.Subscriber("/camera/depth_registered/image_raw", Image, self.depth_image_callback)
         
@@ -23,24 +22,20 @@ class RedObjectFollowerWithDynamicSpeed:
         # OpenCV bridge to convert ROS images to OpenCV format
         self.bridge = CvBridge()
 
-        # Variables for red object detection and obstacle avoidance
+        # Variables to store the red object position and distance
         self.red_object_center = None
         self.red_object_distance = None
         self.image_width = None
-        self.obstacle_distance = float('inf')
-        self.obstacle_threshold = 0.5  # Threshold for obstacle detection in meters
 
-        # Velocity parameters
-        self.current_linear_velocity = 0.0
-        self.current_angular_velocity = 0.0
-        self.min_linear_velocity = 0.05
-        self.max_linear_velocity = 0.4
-        self.max_angular_velocity = 0.5
-        self.velocity_step = 0.01  # Increment for smooth ramping
+        # Obstacle detection
+        self.obstacle_detected = False
+        self.obstacle_threshold = 0.5  # Distance in meters to consider something an obstacle
 
-        # Distance thresholds for dynamic velocity adjustment
-        self.distance_slow_threshold = 0.3  # Slow down if within 30cm
-        self.distance_fast_threshold = 1.0  # Max speed if farther than 1m
+        # Motion control parameters
+        self.max_speed = 0.5
+        self.min_speed = 0.05
+        self.acceleration = 0.02
+        self.current_speed = 0.0
 
     def rgb_image_callback(self, data):
         try:
@@ -64,7 +59,7 @@ class RedObjectFollowerWithDynamicSpeed:
             rospy.logerr(e)
             return
 
-        self.get_object_distance_and_check_obstacles(depth_image)
+        self.get_object_distance_and_check_obstacle(depth_image)
 
     def detect_red_object(self, frame):
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -82,10 +77,10 @@ class RedObjectFollowerWithDynamicSpeed:
 
         if contours:
             largest_contour = max(contours, key=cv2.contourArea)
+
             if cv2.contourArea(largest_contour) > 500:
                 x, y, w, h = cv2.boundingRect(largest_contour)
                 self.red_object_center = (x + w // 2, y + h // 2)
-
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.circle(frame, self.red_object_center, 5, (0, 255, 0), -1)
             else:
@@ -94,67 +89,63 @@ class RedObjectFollowerWithDynamicSpeed:
         cv2.imshow("Red Object Detection", frame)
         cv2.waitKey(1)
 
-    def get_object_distance_and_check_obstacles(self, depth_image):
+    def get_object_distance_and_check_obstacle(self, depth_image):
         if self.red_object_center is not None:
             x, y = self.red_object_center
             self.red_object_distance = depth_image[y, x]
 
-            center_region = depth_image[240:300, 310:330]
-            self.obstacle_distance = np.nanmin(center_region)
-
             if self.red_object_distance > 0 and not np.isnan(self.red_object_distance):
-                self.move_towards_red_object()
+                self.check_for_obstacles(depth_image)
+
+                if not self.obstacle_detected:
+                    self.move_towards_red_object()
+
+    def check_for_obstacles(self, depth_image):
+        x, y = self.red_object_center
+        obstacle_region = depth_image[y - 20:y + 20, x - 20:x + 20]  # Region around the object
+
+        obstacle_distances = obstacle_region[~np.isnan(obstacle_region)]
+
+        if obstacle_distances.size > 0 and np.min(obstacle_distances) < self.obstacle_threshold:
+            self.obstacle_detected = True
+            self.navigate_around_obstacle()
+        else:
+            self.obstacle_detected = False
+
+    def navigate_around_obstacle(self):
+        twist = Twist()
+
+        twist.linear.x = 0.0
+        twist.angular.z = 0.5  # Rotate to find a clear path
+        self.cmd_vel_pub.publish(twist)
+        rospy.loginfo("Obstacle detected. Navigating around...")
 
     def move_towards_red_object(self):
         twist = Twist()
 
-        if self.red_object_distance > 0.1:  # Object farther than 10 cm
-            if self.obstacle_distance < self.obstacle_threshold:
-                rospy.logwarn("Obstacle detected! Stopping.")
-                self.smooth_stop()
-                twist.angular.z = 0.3  # Turn away from the obstacle
-            else:
-                # Adjust velocity dynamically based on distance
-                target_linear_velocity = self.compute_dynamic_velocity(self.red_object_distance)
-                self.current_linear_velocity = self.smooth_velocity(self.current_linear_velocity, target_linear_velocity)
-                twist.linear.x = self.current_linear_velocity
-
-                # Adjust angular velocity to align with the object
-                error = (self.red_object_center[0] - self.image_width / 2) / float(self.image_width / 2)
-                self.current_angular_velocity = max(min(-error * self.max_angular_velocity, self.max_angular_velocity), -self.max_angular_velocity)
-                twist.angular.z = self.current_angular_velocity
+        if self.red_object_distance > 1.0:
+            target_speed = self.max_speed
+        elif self.red_object_distance > 0.1:
+            target_speed = max(self.min_speed, self.red_object_distance * 0.5)
         else:
-            self.smooth_stop()
+            target_speed = 0.0
+
+        if self.current_speed < target_speed:
+            self.current_speed = min(self.current_speed + self.acceleration, target_speed)
+        elif self.current_speed > target_speed:
+            self.current_speed = max(self.current_speed - self.acceleration, target_speed)
+
+        twist.linear.x = self.current_speed
+
+        error = (self.red_object_center[0] - self.image_width / 2) / float(self.image_width / 2)
+        twist.angular.z = -error * 0.5
 
         self.cmd_vel_pub.publish(twist)
-
-    def compute_dynamic_velocity(self, distance):
-        if distance < self.distance_slow_threshold:
-            return self.min_linear_velocity
-        elif distance > self.distance_fast_threshold:
-            return self.max_linear_velocity
-        else:
-            return self.min_linear_velocity + (self.max_linear_velocity - self.min_linear_velocity) * \
-                   ((distance - self.distance_slow_threshold) / (self.distance_fast_threshold - self.distance_slow_threshold))
-
-    def smooth_velocity(self, current, target):
-        if current < target:
-            return min(current + self.velocity_step, target)
-        elif current > target:
-            return max(current - self.velocity_step, target)
-        return target
-
-    def smooth_stop(self):
-        while self.current_linear_velocity > 0:
-            self.current_linear_velocity = max(self.current_linear_velocity - self.velocity_step, 0)
-            twist = Twist()
-            twist.linear.x = self.current_linear_velocity
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.1)
+        rospy.loginfo(f"Speed: {self.current_speed:.2f}, Distance: {self.red_object_distance:.2f}m, Angular Error: {error:.2f}")
 
 if __name__ == '__main__':
     try:
-        RedObjectFollowerWithDynamicSpeed()
+        follower = RedObjectFollower()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
